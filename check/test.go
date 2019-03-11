@@ -15,11 +15,15 @@
 package check
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"k8s.io/client-go/util/jsonpath"
 )
 
 // test:
@@ -37,11 +41,12 @@ const (
 )
 
 type testItem struct {
-	Flag    string
-	Output  string
-	Value   string
-	Set     bool
-	Compare compare
+	Flag     string
+	Jsonpath string
+	Output   string
+	Value    string
+	Set      bool
+	Compare  compare
 }
 
 type compare struct {
@@ -56,32 +61,64 @@ type testOutput struct {
 
 func (t *testItem) execute(s string) *testOutput {
 	result := &testOutput{}
-	match := strings.Contains(s, t.Flag)
+	var match bool
+	var flagVal string
+
+	if t.Flag != "" {
+		// Flag comparison: check if the flag is present in the input
+		match = strings.Contains(s, t.Flag)
+	} else if t.Jsonpath != "" {
+		// Jsonpath comparison: parse the json...
+		j := jsonpath.New("jsonpath")
+		j.AllowMissingKeys(true)
+		err := j.Parse(t.Jsonpath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "unable to parse jsonpath expression: %s", t.Jsonpath)
+			os.Exit(1)
+		}
+		// ... and execute the jsonpath expression
+		buf := new(bytes.Buffer)
+		var jsonInterface interface{}
+		err = json.Unmarshal([]byte(s), &jsonInterface)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cannot unmarshal the provided JSON: %s\nError: %v", s, err)
+			os.Exit(1)
+		}
+		err = j.Execute(buf, jsonInterface)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error executing jsonpath %s: %v", t.Jsonpath, err)
+			os.Exit(1)
+		}
+		jsonpathResult := fmt.Sprintf("%s", buf)
+		match = (jsonpathResult != "")
+		flagVal = jsonpathResult
+	}
 
 	if t.Set {
-		var flagVal string
 		isset := match
 
 		if isset && t.Compare.Op != "" {
-			// Expects flags in the form;
-			// --flag=somevalue
-			// --flag
-			// somevalue
-			//pttn := `(` + t.Flag + `)(=)*([^\s,]*) *`
-			pttn := `(` + t.Flag + `)(=)*([^\s]*) *`
-			flagRe := regexp.MustCompile(pttn)
-			vals := flagRe.FindStringSubmatch(s)
+			if t.Flag != "" {
+				// Expects flags in the form;
+				// --flag=somevalue
+				// --flag
+				// somevalue
+				//pttn := `(` + t.Flag + `)(=)*([^\s,]*) *`
+				pttn := `(` + t.Flag + `)(=)*([^\s]*) *`
+				flagRe := regexp.MustCompile(pttn)
+				vals := flagRe.FindStringSubmatch(s)
 
-			if len(vals) > 0 {
-				if vals[3] != "" {
-					flagVal = vals[3]
+				if len(vals) > 0 {
+					if vals[3] != "" {
+						flagVal = vals[3]
+					} else {
+						flagVal = vals[1]
+					}
 				} else {
-					flagVal = vals[1]
+					fmt.Fprintf(os.Stderr, "invalid flag in testitem definition")
+					os.Exit(1)
 				}
-			} else {
-				fmt.Fprintf(os.Stderr, "invalid flag in testitem definition")
-				os.Exit(1)
-			}
+		    }
 
 			result.actualResult = strings.ToLower(flagVal)
 			switch t.Compare.Op {
